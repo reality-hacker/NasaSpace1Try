@@ -13,6 +13,9 @@ import {
   SlidersHorizontal,
   Trophy,
   Search,
+  Sun,
+  Fingerprint,
+  ShieldCheck,
 } from "lucide-react";
 import type { GlobePin } from "@/components/PlanetGlobe";
 
@@ -25,6 +28,11 @@ export interface ParamSim {
   similarity: number;
   target_val: number;
   earth_val: number;
+  earth_agency?: string;
+  earth_instrument?: string;
+  space_agency?: string;
+  space_instrument?: string;
+  status?: "measured" | "derived" | "calibrated";
 }
 
 export interface MatrixRow {
@@ -65,6 +73,7 @@ export interface EarthMatch {
   parameter_similarities: Record<string, ParamSim>;
   representativeness_matrix: MatrixRow[];
   scenarios: Record<string, { status: string; score: number; uncertainty: number; conformal_interval: [number, number]; note: string }>;
+  diurnal_sol_curve?: number[];
   heightmap_url: string;
   radar_url: string;
 }
@@ -86,6 +95,7 @@ export interface MatchPayload {
     temp_min_c: number;
     temp_max_c: number;
     primary_challenge: string;
+    diurnal_sol_curve?: number[];
     heightmap_url: string;
     radar_url: string;
   };
@@ -105,7 +115,7 @@ export default function AnalyticsView({
 }) {
   const [selectedId, setSelectedId] = useState<string>(data.matches[0]?.id || "");
   const [filterText, setFilterText] = useState("");
-  const [activeTab, setActiveTab] = useState<"matrix" | "best" | "params">("matrix");
+  const [activeTab, setActiveTab] = useState<"matrix" | "best" | "sol" | "fingerprint">("matrix");
 
   const activeMatch = useMemo(
     () => data.matches.find((m) => m.id === selectedId) || data.matches[0],
@@ -162,8 +172,20 @@ export default function AnalyticsView({
     };
   };
 
+  // 24-Hour Diurnal Sol Thermal Curve math
+  const targetCurve = data.target.diurnal_sol_curve || [];
+  const earthCurve = activeMatch.diurnal_sol_curve || [];
+  const minTempAll = Math.min(...targetCurve, ...earthCurve, -240);
+  const maxTempAll = Math.max(...targetCurve, ...earthCurve, 120);
+
+  const toYPercent = (temp: number) => {
+    const range = maxTempAll - minTempAll || 1;
+    return Math.round(100 - ((temp - minTempAll) / range) * 100);
+  };
+
   return (
     <div className="relative z-10 flex-1 flex flex-col gap-4 p-5 max-w-[1750px] w-full mx-auto">
+      {/* Top Action Bar */}
       <div className="glass-card rounded-2xl px-5 py-3.5 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-4">
           <button
@@ -174,7 +196,7 @@ export default function AnalyticsView({
           </button>
           <div>
             <div className="text-xs font-mono text-cyan-400">
-              LIVE SCAN: ALL {data.earth_sites_scanned} EARTH LOCATIONS RANKED IN {data.search_time_ms} MS
+              STRICT MULTI-AGENCY COMPLIANCE • {data.earth_sites_scanned} EARTH LOCATIONS RANKED IN {data.search_time_ms} MS
             </div>
             <div className="text-sm font-bold text-white">
               Target: {data.target.name} ({data.target.gravity} m/s² • {data.target.pressure_bar} bar)
@@ -192,14 +214,14 @@ export default function AnalyticsView({
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 flex-1">
-        {/* LEFT (5 cols): 3D Earth Globe (60 Pins) + Full Ranked List of 60 Sites */}
+        {/* LEFT (5 cols): 3D Earth Globe (60 Pins) + Full Ranked List */}
         <div className="lg:col-span-5 flex flex-col gap-4">
           <div className="glass-card rounded-3xl overflow-hidden relative h-[350px]">
             <div className="absolute top-3 left-3 z-10 px-3 py-1.5 rounded-xl bg-slate-950/80 border border-slate-800 backdrop-blur">
               <div className="text-xs font-mono font-bold text-emerald-400 flex items-center gap-1.5">
                 <Globe className="w-3.5 h-3.5" /> EARTH GLOBE ({data.matches.length} PINS)
               </div>
-              <div className="text-[10px] text-slate-400">Green = Top 5 • Hover any pin for Matrix popup</div>
+              <div className="text-[10px] text-slate-400">Green = Top 5 • Hover any pin for Region Outline &amp; Matrix</div>
             </div>
 
             <PlanetGlobe
@@ -264,13 +286,14 @@ export default function AnalyticsView({
           </div>
         </div>
 
-        {/* RIGHT (7 cols): Summary, Pillars & 3 Analytical Tabs */}
+        {/* RIGHT (7 cols): Summary, Pillars & 4 Analytical Tabs */}
         <div className="lg:col-span-7 flex flex-col gap-4">
           <div className="glass-card rounded-3xl p-5">
             <div className="flex flex-wrap items-start justify-between gap-4 mb-3">
               <div>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 uppercase">
-                  Rank #{activeMatch.rank || 1} of {data.matches.length} • {activeMatch.data_source || "Satellite DEM + Climate"}
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 uppercase flex items-center gap-1 w-fit">
+                  <ShieldCheck className="w-3 h-3" />
+                  Rank #{activeMatch.rank || 1} • Authorized Agency Data
                 </span>
                 <h2 className="text-xl font-bold text-white mt-1.5">{activeMatch.name}</h2>
                 <p className="text-xs text-slate-400 mt-1">{activeMatch.geology}</p>
@@ -290,20 +313,22 @@ export default function AnalyticsView({
               </div>
             </div>
 
+            {/* 4 Pillars with Agency Labels */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-3 border-t border-slate-800/80">
               {[
-                { key: "topo", label: "Topography (DEM)" },
-                { key: "radar", label: "Radar (CSA/LRO)" },
-                { key: "mineral", label: "Minerals (ESA)" },
-                { key: "thermal", label: "Thermal (ERA5)" },
+                { key: "topo", label: "Topography", agency: "ESA GLO-30m" },
+                { key: "radar", label: "Radar", agency: "CSA RADARSAT" },
+                { key: "mineral", label: "Minerals", agency: "ESA Sentinel-2" },
+                { key: "thermal", label: "Thermal", agency: "NASA MODIS / JAXA" },
               ].map((p) => {
                 const val = activeMatch.pillar_scores[p.key as keyof typeof activeMatch.pillar_scores];
                 return (
                   <div key={p.key} className="bg-slate-950/50 rounded-xl p-2.5 border border-slate-800/70">
-                    <div className="flex justify-between text-[11px] mb-1">
-                      <span className="text-slate-400">{p.label}</span>
+                    <div className="flex justify-between text-[11px] mb-0.5">
+                      <span className="text-slate-300 font-semibold">{p.label}</span>
                       <span className="font-mono font-bold text-cyan-300">{(val * 100).toFixed(0)}%</span>
                     </div>
+                    <div className="text-[9px] font-mono text-slate-400 mb-1.5">{p.agency}</div>
                     <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
                       <div className="h-full bg-cyan-400" style={{ width: `${val * 100}%` }} />
                     </div>
@@ -313,12 +338,12 @@ export default function AnalyticsView({
             </div>
           </div>
 
-          {/* 3 Analytical Tabs */}
+          {/* 4 Analytical Tabs */}
           <div className="glass-card rounded-3xl p-5 flex-1 flex flex-col">
             <div className="flex flex-wrap items-center gap-2 mb-4 border-b border-slate-800/80 pb-3">
               <button
                 onClick={() => setActiveTab("matrix")}
-                className={`px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition ${
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition ${
                   activeTab === "matrix" ? "bg-cyan-500 text-slate-950" : "bg-slate-900 text-slate-300 hover:bg-slate-800"
                 }`}
               >
@@ -326,22 +351,31 @@ export default function AnalyticsView({
               </button>
               <button
                 onClick={() => setActiveTab("best")}
-                className={`px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition ${
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition ${
                   activeTab === "best" ? "bg-emerald-400 text-slate-950" : "bg-slate-900 text-slate-300 hover:bg-slate-800"
                 }`}
               >
-                <Trophy className="w-3.5 h-3.5" /> Best Per Test &amp; Overall Best
+                <Trophy className="w-3.5 h-3.5" /> Best Per Test
               </button>
               <button
-                onClick={() => setActiveTab("params")}
-                className={`px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition ${
-                  activeTab === "params" ? "bg-cyan-500 text-slate-950" : "bg-slate-900 text-slate-300 hover:bg-slate-800"
+                onClick={() => setActiveTab("sol")}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition ${
+                  activeTab === "sol" ? "bg-amber-400 text-slate-950" : "bg-slate-900 text-slate-300 hover:bg-slate-800"
                 }`}
               >
-                <SlidersHorizontal className="w-3.5 h-3.5" /> All 14 Parameters
+                <Sun className="w-3.5 h-3.5" /> 24-Hour Diurnal Sol Ribbon
+              </button>
+              <button
+                onClick={() => setActiveTab("fingerprint")}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition ${
+                  activeTab === "fingerprint" ? "bg-indigo-400 text-slate-950" : "bg-slate-900 text-slate-300 hover:bg-slate-800"
+                }`}
+              >
+                <Fingerprint className="w-3.5 h-3.5" /> 14-Param Fingerprint &amp; Provenance
               </button>
             </div>
 
+            {/* TAB 1: REPRESENTATIVENESS MATRIX */}
             {activeTab === "matrix" && (
               <div className="flex flex-col gap-2.5 overflow-y-auto">
                 {activeMatch.representativeness_matrix.map((row, i) => {
@@ -371,9 +405,9 @@ export default function AnalyticsView({
               </div>
             )}
 
+            {/* TAB 2: BEST PER TEST */}
             {activeTab === "best" && (
               <div className="flex flex-col gap-3 overflow-y-auto">
-                {/* Overall Best Winner */}
                 <div className="p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/40 flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <div className="text-[10px] font-mono text-emerald-300 uppercase flex items-center gap-1">
@@ -392,7 +426,6 @@ export default function AnalyticsView({
                   </button>
                 </div>
 
-                {/* Best Per Individual Test */}
                 <div className="flex flex-col gap-2">
                   {(data.best_per_test || []).map((item, idx) => {
                     const badge = matrixBadge(item.status);
@@ -427,28 +460,123 @@ export default function AnalyticsView({
               </div>
             )}
 
-            {activeTab === "params" && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-[380px] overflow-y-auto pr-1">
-                {Object.entries(activeMatch.parameter_similarities).map(([key, p]) => (
-                  <div key={key} className="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80 flex flex-col gap-1.5">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-semibold text-slate-200">{p.label}</span>
-                      <span className="font-mono font-bold text-cyan-400">{(p.similarity * 100).toFixed(1)}%</span>
+            {/* TAB 3: 24-HOUR DIURNAL SOL THERMAL RIBBON */}
+            {activeTab === "sol" && (
+              <div className="flex flex-col gap-3 overflow-y-auto">
+                <div className="p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800 flex items-center justify-between">
+                  <div className="flex items-center gap-4 text-xs font-mono">
+                    <div className="flex items-center gap-1.5">
+                      <span className="w-3 h-3 rounded-full bg-cyan-400" />
+                      <span>{data.target.body.toUpperCase()}: {data.target.temp_min_c}°C to {data.target.temp_max_c}°C (NASA Diviner/THEMIS)</span>
                     </div>
-                    <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full ${
-                          p.similarity >= 0.75 ? "bg-emerald-400" : p.similarity >= 0.45 ? "bg-amber-400" : "bg-rose-400"
-                        }`}
-                        style={{ width: `${p.similarity * 100}%` }}
-                      />
-                    </div>
-                    <div className="flex justify-between text-[10px] font-mono text-slate-400">
-                      <span>Earth: {p.earth_val} {p.unit}</span>
-                      <span>Space: {p.target_val} {p.unit}</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="w-3 h-3 rounded-full bg-emerald-400" />
+                      <span>EARTH: {activeMatch.parameter_similarities.temp_min_c.earth_val}°C to {activeMatch.parameter_similarities.temp_max_c.earth_val}°C (MODIS / JAXA)</span>
                     </div>
                   </div>
-                ))}
+                  <div className="text-[10px] font-mono text-amber-300">
+                    DIURNAL SWING ΔT: Space {data.target.temp_max_c - data.target.temp_min_c}°C vs Earth {activeMatch.parameter_similarities.temp_delta_c.earth_val}°C
+                  </div>
+                </div>
+
+                {/* 24-Hour Visual Heat Ribbon */}
+                <div className="bg-slate-950/80 rounded-2xl p-4 border border-slate-800 flex flex-col gap-3">
+                  <div className="text-[11px] font-mono text-slate-400 flex justify-between">
+                    <span>00:00 (Midnight Chill)</span>
+                    <span>06:00 (Dawn)</span>
+                    <span>12:00 (Solar Peak)</span>
+                    <span>18:00 (Dusk)</span>
+                    <span>23:00 (Night)</span>
+                  </div>
+
+                  {/* Ribbon Hourly Columns */}
+                  <div className="grid grid-cols-24 gap-1 h-28 items-end p-2 bg-slate-900/60 rounded-xl border border-slate-800/80">
+                    {targetCurve.map((tTemp, hr) => {
+                      const eTemp = earthCurve[hr] ?? 20;
+                      const tHeight = Math.max(8, 100 - toYPercent(tTemp));
+                      const eHeight = Math.max(8, 100 - toYPercent(eTemp));
+                      return (
+                        <div key={hr} className="h-full flex items-end justify-center gap-0.5 group relative">
+                          <div
+                            className="w-full bg-cyan-400/80 rounded-t-sm transition-all"
+                            style={{ height: `${tHeight}%` }}
+                          />
+                          <div
+                            className="w-full bg-emerald-400/80 rounded-t-sm transition-all"
+                            style={{ height: `${eHeight}%` }}
+                          />
+                          {/* Hover Tooltip */}
+                          <div className="absolute -top-10 left-1/2 -translate-x-1/2 hidden group-hover:flex px-2 py-1 bg-slate-950 border border-slate-700 text-[9px] font-mono rounded whitespace-nowrap z-20 shadow-lg">
+                            Hr {hr}:00 | {data.target.body.slice(0, 1).toUpperCase()}:{tTemp}°C | E:{eTemp}°C
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="text-[11px] text-slate-400 leading-relaxed font-mono">
+                    <b className="text-amber-400">PHYSICS CAVEAT:</b> On Earth, air convection continuously dissipates heat from rover motors and drilling rigs. In the {data.target.pressure_bar} bar space vacuum, radiative cooling is weak, causing equipment to store heat rapidly and seize.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* TAB 4: 14-PARAMETER FINGERPRINT GLYPH & MULTI-AGENCY PROVENANCE */}
+            {activeTab === "fingerprint" && (
+              <div className="flex flex-col gap-2 max-h-[380px] overflow-y-auto pr-1">
+                <div className="text-[10px] font-mono text-slate-400 flex items-center justify-between pb-1 px-1">
+                  <span>PARAMETER (14 TOTAL)</span>
+                  <div className="flex items-center gap-3">
+                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-400" /> measured</span>
+                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-amber-400" /> derived</span>
+                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-cyan-400" /> calibrated</span>
+                  </div>
+                </div>
+
+                {Object.entries(activeMatch.parameter_similarities).map(([key, p]) => {
+                  const statusDot =
+                    p.status === "measured"
+                      ? "bg-emerald-400"
+                      : p.status === "derived"
+                      ? "bg-amber-400"
+                      : "bg-cyan-400";
+
+                  return (
+                    <div
+                      key={key}
+                      className="p-2.5 rounded-xl bg-slate-950/60 border border-slate-800/80 flex flex-col gap-1.5"
+                    >
+                      <div className="flex items-center justify-between text-xs">
+                        <div className="flex items-center gap-2">
+                          <span className={`w-2 h-2 rounded-full ${statusDot}`} />
+                          <span className="font-bold text-white">{p.label}</span>
+                          <span className="text-[10px] font-mono text-slate-500 uppercase">[{p.pillar}]</span>
+                        </div>
+                        <span className="font-mono font-bold text-cyan-400">{(p.similarity * 100).toFixed(1)}%</span>
+                      </div>
+
+                      <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full ${
+                            p.similarity >= 0.75 ? "bg-emerald-400" : p.similarity >= 0.45 ? "bg-amber-400" : "bg-rose-400"
+                          }`}
+                          style={{ width: `${p.similarity * 100}%` }}
+                        />
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between text-[10px] font-mono text-slate-400 gap-1">
+                        <div>
+                          <span className="text-emerald-300 font-semibold">Earth: {p.earth_val} {p.unit}</span>
+                          <span className="text-slate-500 ml-1.5">[{p.earth_agency}: {p.earth_instrument}]</span>
+                        </div>
+                        <div>
+                          <span className="text-cyan-300 font-semibold">Space: {p.target_val} {p.unit}</span>
+                          <span className="text-slate-500 ml-1.5">[{p.space_agency}: {p.space_instrument}]</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

@@ -19,6 +19,9 @@ import {
   Eye,
   Info,
   Sparkles,
+  ShieldCheck,
+  Zap,
+  Wind,
 } from "lucide-react";
 import type { EarthMatch, MatchPayload } from "@/components/AnalyticsView";
 
@@ -30,6 +33,14 @@ interface RunRecord {
   timeSec: number;
   metricLabel: string;
   reason: string;
+  telemetryLog?: {
+    peakSlip?: number;
+    minWheel?: number;
+    peakTemp?: number;
+    touchSpeed?: number;
+    fuelRemaining?: number;
+    avgNormalN?: number;
+  };
 }
 
 interface RoverSpec {
@@ -118,6 +129,7 @@ const ROVER_CATALOG: RoverSpec[] = [
 ];
 
 const WORLD_SIZE = 60;
+const VEHICLE_MASS_KG = 650;
 
 function hashString(str?: string): number {
   if (!str) return 777;
@@ -129,7 +141,6 @@ function hashString(str?: string): number {
   return Math.abs(h);
 }
 
-/** Levels a small 4.5m pad at (0,0) AND tapers outer 3.5m edge smoothly to 0.0 to meet the outer horizon skirt */
 function applyTerrainShaping(grid: number[], wx: number, wz: number, rawHNorm: number): number {
   if (!grid || grid.length !== 128 * 128) return rawHNorm;
   let shaped = rawHNorm;
@@ -151,7 +162,6 @@ function applyTerrainShaping(grid: number[], wx: number, wz: number, rawHNorm: n
 
 function sampleBilinear(grid: number[], reliefScale: number, wx: number, wz: number): { h: number; slopeDeg: number } {
   if (!grid || grid.length !== 128 * 128) return { h: 0, slopeDeg: 0 };
-  // Outside playable 60x60 square, surrounding skirt sits cleanly at y = 0
   if (Math.abs(wx) > WORLD_SIZE / 2 || Math.abs(wz) > WORLD_SIZE / 2) {
     return { h: 0, slopeDeg: 0 };
   }
@@ -368,14 +378,12 @@ function RealisticTerrain({
     bouldersRef.current.instanceMatrix.needsUpdate = true;
   }, [siteId, elevData, reliefScale, boulderCount]);
 
-  // 4 Non-overlapping Outer Horizon Aprons (strictly OUTSIDE [-30, +30] so they NEVER cover low valleys!)
   const skirtColor = useMemo(() => cLow, [cLow]);
-  const half = WORLD_SIZE / 2; // 30
-  const ext = 160; // outer extension width
+  const half = WORLD_SIZE / 2;
+  const ext = 160;
 
   return (
     <group>
-      {/* Playable 60x60 128x128 Real DEM Mesh (100% uncovered!) */}
       <mesh geometry={geometry} receiveShadow>
         <meshStandardMaterial
           vertexColors
@@ -385,7 +393,6 @@ function RealisticTerrain({
         />
       </mesh>
 
-      {/* North, South, East, West Seamless Horizon Aprons strictly outside [-30, +30] at y = 0 */}
       <mesh position={[0, 0, -(half + ext / 2)]} rotation={[-Math.PI / 2, 0, 0]}>
         <planeGeometry args={[WORLD_SIZE + ext * 2, ext]} />
         <meshStandardMaterial color={skirtColor} wireframe={sensorMode === "sar"} roughness={0.95} />
@@ -527,6 +534,9 @@ function FirstPersonScene({
     drillTemp: 30,
     seized: false,
     lastUiEmit: 0,
+    peakSlip: 0,
+    normalAccum: 0,
+    normalCount: 0,
   });
 
   const rockStats = useMemo(() => {
@@ -568,6 +578,9 @@ function FirstPersonScene({
       drillTemp: startTemp,
       seized: false,
       lastUiEmit: 0,
+      peakSlip: 0,
+      normalAccum: 0,
+      normalCount: 0,
     };
 
     if (scenario === "rover") {
@@ -607,7 +620,6 @@ function FirstPersonScene({
     const k = keysRef.current;
     if (!elevData || elevData.length !== 128 * 128 || isModalOpen) return;
 
-    // 1. ROVER TRAVERSE + REAL CAMERA-TERRAIN COLLIDER
     if (scenario === "rover") {
       const forward = (k["KeyW"] || k["ArrowUp"] ? 1 : 0) - (k["KeyS"] || k["ArrowDown"] ? 1 : 0);
       const steer = (k["KeyA"] || k["ArrowLeft"] ? 1 : 0) - (k["KeyD"] || k["ArrowRight"] ? 1 : 0);
@@ -617,8 +629,21 @@ function FirstPersonScene({
         if (s.started) s.elapsed += dt;
 
         const { slopeDeg } = sampleBilinear(elevData, reliefScale, s.rx, s.rz);
+        const slopeRad = THREE.MathUtils.degToRad(slopeDeg);
+
+        const normalForceN = VEHICLE_MASS_KG * gravity * Math.cos(slopeRad);
+        s.normalAccum += normalForceN;
+        s.normalCount += 1;
+
         const steerRate = (bodyType === "earth" ? 1.85 : bodyType === "mars" ? 1.45 : 1.2) * roverSpec.slopeGrip;
         s.yaw += steer * steerRate * dt;
+
+        const frictionMu = (bodyType === "earth" ? 0.75 : bodyType === "mars" ? 0.58 : 0.44) * roverSpec.slopeGrip;
+        const gripLimitN = frictionMu * normalForceN;
+        const tractionDemandN = VEHICLE_MASS_KG * gravity * Math.sin(slopeRad) + (forward !== 0 ? 1150 : 250);
+        const slipRatio = Math.min(1.0, Math.max(0.04, tractionDemandN / (gripLimitN + 1e-4) * 0.42));
+        const slipPct = Math.round(slipRatio * 100);
+        s.peakSlip = Math.max(s.peakSlip, slipPct);
 
         const envGrip = bodyType === "earth" ? 1.0 : bodyType === "mars" ? 0.78 : 0.62;
         const slopePenalty = Math.max(0, (slopeDeg - 12) * 0.028) / (envGrip * roverSpec.slopeGrip);
@@ -653,6 +678,12 @@ function FirstPersonScene({
             timeSec: Number(s.elapsed.toFixed(1)),
             metricLabel: `${roverSpec.name} • Wheels 0%`,
             reason: `${roverSpec.wheelMaterial} shredded on ${rockStats.label} regolith! Upgrade to stronger wheels.`,
+            telemetryLog: {
+              peakSlip: s.peakSlip,
+              minWheel: 0,
+              peakTemp: Math.round(s.motorTemp),
+              avgNormalN: Math.round(s.normalAccum / Math.max(1, s.normalCount)),
+            },
           });
         }
 
@@ -665,6 +696,12 @@ function FirstPersonScene({
               timeSec: Number(s.elapsed.toFixed(1)),
               metricLabel: `$${roverSpec.costM}M • Wheels ${s.wheelHealth.toFixed(0)}% • Peak ${s.motorTemp.toFixed(0)}°C`,
               reason: `${roverSpec.name} completed all 3 beacons in ${s.elapsed.toFixed(1)}s!`,
+              telemetryLog: {
+                peakSlip: s.peakSlip,
+                minWheel: Math.round(s.wheelHealth),
+                peakTemp: Math.round(s.motorTemp),
+                avgNormalN: Math.round(s.normalAccum / Math.max(1, s.normalCount)),
+              },
             });
           } else {
             s.beaconIdx += 1;
@@ -719,14 +756,12 @@ function FirstPersonScene({
           const curFocus = new THREE.Vector3(s.rx, bodyY + 0.25, s.rz);
           const deltaMove = curFocus.clone().sub(prevFocusRef.current);
           camera.position.add(deltaMove);
-          // Clamp 3rd-person orbit camera strictly ABOVE the mountain underneath it!
           const hUnderCam = sampleBilinear(elevData, reliefScale, camera.position.x, camera.position.z).h;
           camera.position.y = Math.max(camera.position.y, hUnderCam + 0.9);
           controlsRef.current.target.copy(curFocus);
           prevFocusRef.current.copy(curFocus);
           controlsRef.current.update();
         } else {
-          // 1st-Person Camera placed ahead of front bumper AND clamped above mountain height at (camX, camZ)!
           const viewYaw = s.yaw + lookOffsetRef.current.yaw;
           const camX = s.rx - Math.sin(s.yaw) * 0.90;
           const camZ = s.rz - Math.cos(s.yaw) * 0.90;
@@ -765,12 +800,15 @@ function FirstPersonScene({
             beacon: `${s.beaconIdx + 1}/${beacons.length}`,
             slope: slopeDeg.toFixed(1),
             bearingDeg,
+            normalForceN: Math.round(normalForceN),
+            gripLimitN: Math.round(gripLimitN),
+            slipPct,
+            coolingMode: pressureBar > 0.5 ? "Air Convective (1.01 bar)" : "Radiative Vacuum",
           });
         }
       }
     }
 
-    // 2. LANDER DESCENT + CAMERA COLLIDER
     if (scenario === "landing") {
       const thrust = k["Space"] || k["ThrustHold"] ? 1 : 0;
       const fwdInput = (k["KeyW"] || k["ArrowUp"] ? 1 : 0) - (k["KeyS"] || k["ArrowDown"] ? 1 : 0);
@@ -840,6 +878,7 @@ function FirstPersonScene({
           smokeGroupRef.current.scale.set(sScale, 0.7 + s.groundHeat * 0.9, sScale);
         }
 
+        const plumeM = (4.5 + (1.0 - Math.min(pressureBar / 1.013, 1.0)) * 75.0) * Math.max(0.1, s.groundHeat);
         if (plumeRingRef.current) {
           const dustStrength = firing && altitude < 10 ? (1 - altitude / 10) * (1.2 + (1 - pressureBar / 1.013) * 3.8) : 0.01;
           plumeRingRef.current.position.set(s.lx, groundH + 0.12, s.lz);
@@ -886,12 +925,16 @@ function FirstPersonScene({
           onComplete({
             status: passed ? "PASS" : "FAIL",
             timeSec: Number(s.elapsed.toFixed(1)),
-            metricLabel: `Speed ${touchSpeed.toFixed(1)} m/s | Fuel ${s.fuel.toFixed(0)}%`,
+            metricLabel: `Touchdown ${touchSpeed.toFixed(1)} m/s | Fuel ${s.fuel.toFixed(0)}%`,
             reason: passed
               ? `Soft touchdown on pad in ${s.elapsed.toFixed(1)}s (${touchSpeed.toFixed(1)} m/s).`
               : !safeSpeed
               ? `HARD IMPACT (${touchSpeed.toFixed(1)} m/s > 4.0 m/s limit) — Landing legs buckled!`
               : `MISSED PAD (${distFromPad.toFixed(1)}m off target / ${slopeDeg.toFixed(0)}° slope) — Tip-over!`,
+            telemetryLog: {
+              touchSpeed: Number(touchSpeed.toFixed(1)),
+              fuelRemaining: Math.round(s.fuel),
+            },
           });
         }
 
@@ -906,13 +949,13 @@ function FirstPersonScene({
             fuel: s.fuel.toFixed(0),
             padDist: distFromPad.toFixed(1),
             surfaceHeatC: (ambientTempC + s.groundHeat * 850).toFixed(0),
+            plumeRadiusM: plumeM.toFixed(1),
             dustBlind: firing && altitude < 9 && pressureBar < 0.05,
           });
         }
       }
     }
 
-    // 3. CORE DRILLING RIG + CAMERA COLLIDER
     if (scenario === "mining") {
       const drilling = k["Space"] || k["KeyE"] || k["DrillHold"];
       const padH = sampleBilinear(elevData, reliefScale, 0, 0).h;
@@ -952,6 +995,9 @@ function FirstPersonScene({
             timeSec: Number(s.elapsed.toFixed(1)),
             metricLabel: `Depth ${s.depth.toFixed(2)}m | Seized 180°C`,
             reason: `THERMAL SEIZURE in ${pressureBar} bar atmosphere on ${rockStats.label}! Pulse the drill in vacuum.`,
+            telemetryLog: {
+              peakTemp: 180,
+            },
           });
         } else if (s.depth >= 2.0) {
           s.finished = true;
@@ -960,6 +1006,9 @@ function FirstPersonScene({
             timeSec: Number(s.elapsed.toFixed(1)),
             metricLabel: `2.00m Core | Peak ${s.drillTemp.toFixed(0)}°C`,
             reason: `2.00m ${rockStats.label} core extracted in ${s.elapsed.toFixed(1)}s.`,
+            telemetryLog: {
+              peakTemp: Math.round(s.drillTemp),
+            },
           });
         }
 
@@ -1013,6 +1062,7 @@ function FirstPersonScene({
             drilling: Boolean(drilling),
             rockLabel: rockStats.label,
             hardness: rockStats.hardness.toFixed(2),
+            coolingMode: pressureBar > 0.5 ? "Convective Air Cooling" : "Radiative Vacuum",
           });
         }
       }
@@ -1370,6 +1420,15 @@ export default function DualSimulator({
 
   const selectedRover = ROVER_CATALOG.find((r) => r.id === selectedRoverId) || ROVER_CATALOG[1];
 
+  const rockStats = useMemo(() => {
+    if (bareness < 0.25) {
+      return { label: "Waterlogged Mud / Biomass", hardness: 0.55 };
+    }
+    const hardness = THREE.MathUtils.clamp(0.75 + ironRatio * 0.45 - clayRatio * 0.35, 0.55, 1.65);
+    const label = activeMineral.replace(/_/g, " ").toUpperCase();
+    return { label, hardness };
+  }, [bareness, ironRatio, clayRatio, activeMineral]);
+
   const handleComplete = (res: RunRecord) => {
     setModalResult(res);
     if (worldSide === "earth") {
@@ -1392,7 +1451,7 @@ export default function DualSimulator({
             onClick={onBack}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs border border-slate-700 cursor-pointer transition"
           >
-            <ArrowLeft className="w-3.5 h-3.5" /> Back
+            <ArrowLeft className="w-3.5 h-3.5" /> Back to Analytics
           </button>
 
           <div className="flex items-center gap-1.5 bg-slate-950/80 p-1 rounded-xl border border-slate-800">
@@ -1479,7 +1538,7 @@ export default function DualSimulator({
         <div className="glass-card rounded-2xl p-3 flex flex-col gap-2">
           <div className="flex items-center justify-between text-[11px] font-mono text-slate-300 px-1">
             <span>SELECT ROVER HARDWARE (Test Cost vs. Reliability on {activeBody.toUpperCase()}):</span>
-            <span className="text-emerald-300">AI Recommended = Best Cost/Reliability Balance</span>
+            <span className="text-emerald-300">AI Recommended = Optimum Cost / Physics Compatibility</span>
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
             {ROVER_CATALOG.map((r) => {
@@ -1521,7 +1580,7 @@ export default function DualSimulator({
           {scenario === "rover" && (
             <span>
               <b className="text-emerald-400">PASS:</b> Reach 3 beacons with Wheels &gt; 0% |{" "}
-              <b className="text-rose-400">FAIL:</b> Wheels hit 0% (Budget buggies shred tires &amp; overheat in vacuum!)
+              <b className="text-rose-400">FAIL:</b> Wheels reach 0% (Budget buggies shred tires in vacuum!)
             </span>
           )}
           {scenario === "landing" && (
@@ -1533,12 +1592,12 @@ export default function DualSimulator({
           {scenario === "mining" && (
             <span>
               <b className="text-emerald-400">PASS:</b> Drill 2.00m core before Bit hits 180°C |{" "}
-              <b className="text-rose-400">FAIL:</b> Bit hits 180°C or wet mud clogs bit (Rock: {activeMineral.replace(/_/g, " ")})
+              <b className="text-rose-400">FAIL:</b> Bit hits 180°C or wet mud clogs bit (Rock: {rockStats.label})
             </span>
           )}
         </span>
         <span className="text-slate-400">
-          {activeBody.toUpperCase()} ({activeGravity} m/s² | {activePressure} bar | Iron: {ironRatio.toFixed(2)} | Clay: {clayRatio.toFixed(2)})
+          Gravity: {activeGravity} m/s² | Pressure: {activePressure} bar | Hardness: {rockStats.label}
         </span>
       </div>
 
@@ -1579,11 +1638,17 @@ export default function DualSimulator({
                 <span>WHEELS: <b className={Number(telemetry.wheelHealth) < 35 ? "text-rose-400" : "text-emerald-300"}>{telemetry.wheelHealth || 100}%</b></span>
               </div>
               <div className="flex items-center gap-1.5">
-                <Thermometer className="w-4 h-4 text-amber-400" />
-                <span>MOTOR: <b className={telemetry.overheated ? "text-rose-400" : "text-amber-300"}>{telemetry.temp || 30}°C / {telemetry.maxTemp || selectedRover.maxTempC}°C</b></span>
+                <Zap className="w-3.5 h-3.5 text-amber-400" />
+                <span>NORMAL FORCE: <b className="text-amber-300">{telemetry.normalForceN || Math.round(VEHICLE_MASS_KG * activeGravity)} N</b></span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span>SLIP: <b className={Number(telemetry.slipPct) > 40 ? "text-rose-400" : "text-cyan-300"}>{telemetry.slipPct || 4}%</b></span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Thermometer className="w-3.5 h-3.5 text-rose-400" />
+                <span>MOTOR: <b className={telemetry.overheated ? "text-rose-400" : "text-slate-200"}>{telemetry.temp || 30}°C / {selectedRover.maxTempC}°C</b></span>
               </div>
               <div>BEACON: <b className="text-cyan-300">{telemetry.beacon || "1/3"}</b></div>
-              <div>SLOPE: <b>{telemetry.slope || "0"}°</b></div>
             </>
           )}
 
@@ -1601,7 +1666,7 @@ export default function DualSimulator({
             <>
               <div>DEPTH: <b className="text-cyan-300">{telemetry.depth || "0.00"} / 2.00m</b></div>
               <div>BIT TEMP: <b className={Number(telemetry.drillTemp) > 135 ? "text-rose-400" : "text-emerald-300"}>{telemetry.drillTemp || 30}°C / 180°C</b></div>
-              <div>HARDNESS: <b className="text-amber-300">{telemetry.hardness || "1.00"}x</b></div>
+              <div>ROCK: <b className="text-amber-300">{telemetry.rockLabel || rockStats.label}</b></div>
             </>
           )}
         </div>
@@ -1630,7 +1695,7 @@ export default function DualSimulator({
         )}
 
         <div className="absolute bottom-4 left-4 z-10 bg-slate-950/85 border border-slate-800 rounded-xl px-3.5 py-2 text-xs font-mono text-slate-300 flex items-center gap-3">
-          {scenario === "rover" && <span>CONTROLS: <b>W / A / S / D</b> to drive • <b>Drag Mouse</b> anytime to look/orbit 360°</span>}
+          {scenario === "rover" && <span>CONTROLS: <b>W / A / S / D</b> to drive • <b>Drag Mouse</b> to look/orbit 360°</span>}
           {scenario === "landing" && (
             <>
               <span>CONTROLS: Hold <b>SPACE</b> for Thruster • <b>W / A / S / D</b> to steer • <b>Drag Mouse</b> to look/orbit</span>
